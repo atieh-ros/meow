@@ -44,7 +44,8 @@ func main() {
 			getEndpoint(w, r)
 		case http.MethodPost:
 			postEndpoint(w, r, *file)
-		// TODO: support http.MethodDelete to delete endpoints
+		case http.MethodDelete: // اضافه شده برای وظیفه Z2
+			deleteEndpoint(w, r, *file)
 		default:
 			log.Printf("request from %s rejected: method %s not allowed",
 				r.RemoteAddr, r.Method)
@@ -125,6 +126,33 @@ func postEndpoint(w http.ResponseWriter, r *http.Request, file string) {
 	}
 	cfg.mu.Unlock()
 	w.WriteHeader(status)
+}
+
+// تابع حذف برای وظیفه Z2
+func deleteEndpoint(w http.ResponseWriter, r *http.Request, file string) {
+	log.Printf("DELETE %s from %s", r.URL, r.RemoteAddr)
+	identifier, err := extractEndpointIdentifier(r.URL.String())
+	if err != nil {
+		log.Printf("extract endpoint identifier of %s: %v", r.URL, err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+
+	if _, ok := cfg.config[identifier]; ok {
+		delete(cfg.config, identifier)
+		if err := writeConfig(cfg.config, file); err != nil {
+			log.Printf("write config after delete: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	} else {
+		log.Printf(`no such endpoint "%s"`, identifier)
+		w.WriteHeader(http.StatusNotFound)
+	}
 }
 
 func getEndpoints(w http.ResponseWriter, r *http.Request) {
