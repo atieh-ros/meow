@@ -30,7 +30,7 @@ func main() {
 	ctx := context.Background()
 	client, err := valkey.NewClient(valkey.ClientOption{
 		InitAddress: []string{"valkey.frickelcloud.ch:6379"},
-		SelectDB:    11, // دیتابیس اختصاصی شما
+		SelectDB:    11, 
 	})
 	if err != nil {
 		log.Fatalf("failed to connect to valkey: %v", err)
@@ -93,8 +93,6 @@ func postEndpoint(w http.ResponseWriter, r *http.Request, vk valkey.Client, ctx 
 		return
 	}
 
-	// اصلاح نهایی: استفاده از متد Mset برای ارسال نقشه فیلدها و مقادیر
-	// روش جایگزین اگر بالایی خطا داد
 	err := vk.Do(ctx, vk.B().Hset().
 		Key("endpoint:"+payload.Identifier).
 		FieldValue().
