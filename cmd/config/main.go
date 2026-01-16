@@ -1,248 +1,159 @@
 package main
 
 import (
-	"bytes"
-	"encoding/csv"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"regexp"
 	"strconv"
-	"sync"
 
 	"github.com/patrickbucher/meow"
+	"github.com/valkey-io/valkey-go"
 )
-
-// Config maps the identifiers to endpoints.
-type Config map[string]*meow.Endpoint
-
-// ConcurrentConfig wraps the config together with a mutex.
-type ConcurrentConfig struct {
-	mu     sync.RWMutex
-	config Config
-}
-
-var cfg ConcurrentConfig
 
 func main() {
 	addr := flag.String("addr", "0.0.0.0", "listen to address")
 	port := flag.Uint("port", 8000, "listen on port")
-	file := flag.String("file", "config.csv", "CSV file to store the configuration")
 	flag.Parse()
 
 	log.SetOutput(os.Stderr)
 
-	cfg.config = mustReadConfig(*file)
+	valkeyURL := os.Getenv("VALKEY_URL")
+	if valkeyURL == "" {
+		valkeyURL = "valkey.frickelcloud.ch:6379"
+	}
+
+	ctx := context.Background()
+	client, err := valkey.NewClient(valkey.ClientOption{
+		InitAddress: []string{"valkey.frickelcloud.ch:6379"},
+		SelectDB:    11, // دیتابیس اختصاصی شما
+	})
+	if err != nil {
+		log.Fatalf("failed to connect to valkey: %v", err)
+	}
+	defer client.Close()
 
 	http.HandleFunc("/endpoints/", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			getEndpoint(w, r)
+			getEndpoint(w, r, client, ctx)
 		case http.MethodPost:
-			postEndpoint(w, r, *file)
-		case http.MethodDelete: // اضافه شده برای وظیفه Z2
-			deleteEndpoint(w, r, *file)
+			postEndpoint(w, r, client, ctx)
+		case http.MethodDelete:
+			deleteEndpoint(w, r, client, ctx)
 		default:
-			log.Printf("request from %s rejected: method %s not allowed",
-				r.RemoteAddr, r.Method)
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 	})
+
 	http.HandleFunc("/endpoints", func(w http.ResponseWriter, r *http.Request) {
-		getEndpoints(w, r)
+		getEndpoints(w, r, client, ctx)
 	})
 
 	listenTo := fmt.Sprintf("%s:%d", *addr, *port)
 	log.Printf("listen to %s", listenTo)
-	http.ListenAndServe(listenTo, nil)
+	log.Fatal(http.ListenAndServe(listenTo, nil))
 }
 
-func getEndpoint(w http.ResponseWriter, r *http.Request) {
-	log.Printf("GET %s from %s", r.URL, r.RemoteAddr)
+func getEndpoint(w http.ResponseWriter, r *http.Request, vk valkey.Client, ctx context.Context) {
 	identifier, err := extractEndpointIdentifier(r.URL.String())
 	if err != nil {
-		log.Printf("extract endpoint identifier of %s: %v", r.URL, err)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	cfg.mu.RLock()
-	endpoint, ok := cfg.config[identifier]
-	cfg.mu.RUnlock()
-	if ok {
-		payload, err := endpoint.JSON()
-		if err != nil {
-			log.Printf("convert %v to JSON: %v", endpoint, err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.Write(payload)
-	} else {
-		log.Printf(`no such endpoint "%s"`, identifier)
+
+	data, err := vk.Do(ctx, vk.B().Hgetall().Key("endpoint:"+identifier).Build()).AsStrMap()
+	if err != nil || len(data) == 0 {
 		w.WriteHeader(http.StatusNotFound)
-	}
-}
-
-func postEndpoint(w http.ResponseWriter, r *http.Request, file string) {
-	log.Printf("POST %s from %s", r.URL, r.RemoteAddr)
-	buf := bytes.NewBufferString("")
-	io.Copy(buf, r.Body)
-	defer r.Body.Close()
-	endpoint, err := meow.EndpointFromJSON(buf.String())
-	if err != nil {
-		log.Printf("parse JSON body: %v", err)
-		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	cfg.mu.RLock()
-	_, exists := cfg.config[endpoint.Identifier]
-	cfg.mu.RUnlock()
-	var status int
-	if exists {
-		// updating existing endpoint
-		identifierPathParam, err := extractEndpointIdentifier(r.URL.String())
-		if err != nil {
-			log.Printf("extract endpoint identifier of %s: %v", r.URL, err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		if identifierPathParam != endpoint.Identifier {
-			log.Printf("identifier mismatch: (ressource: %s, body: %s)",
-				identifierPathParam, endpoint.Identifier)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		status = http.StatusNoContent
-	} else {
-		status = http.StatusCreated
+
+	sOnline, _ := strconv.Atoi(data["statusOnline"])
+	fAfter, _ := strconv.Atoi(data["failAfter"])
+
+	payload := meow.EndpointPayload{
+		Identifier:   identifier,
+		URL:          data["url"],
+		Method:       data["method"],
+		StatusOnline: uint16(sOnline),
+		Frequency:    data["frequency"],
+		FailAfter:    uint8(fAfter),
 	}
-	cfg.mu.Lock()
-	cfg.config[endpoint.Identifier] = endpoint
-	if err := writeConfig(cfg.config, file); err != nil {
-		status = http.StatusInternalServerError
-	}
-	cfg.mu.Unlock()
-	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(payload)
 }
 
-// تابع حذف برای وظیفه Z2
-func deleteEndpoint(w http.ResponseWriter, r *http.Request, file string) {
-	log.Printf("DELETE %s from %s", r.URL, r.RemoteAddr)
-	identifier, err := extractEndpointIdentifier(r.URL.String())
-	if err != nil {
-		log.Printf("extract endpoint identifier of %s: %v", r.URL, err)
+func postEndpoint(w http.ResponseWriter, r *http.Request, vk valkey.Client, ctx context.Context) {
+	var payload meow.EndpointPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	cfg.mu.Lock()
-	defer cfg.mu.Unlock()
+	// اصلاح نهایی: استفاده از متد Mset برای ارسال نقشه فیلدها و مقادیر
+	// روش جایگزین اگر بالایی خطا داد
+	err := vk.Do(ctx, vk.B().Hset().
+		Key("endpoint:"+payload.Identifier).
+		FieldValue().
+		FieldValue("url", payload.URL).
+		FieldValue("method", payload.Method).
+		FieldValue("statusOnline", strconv.Itoa(int(payload.StatusOnline))).
+		FieldValue("frequency", payload.Frequency).
+		FieldValue("failAfter", strconv.Itoa(int(payload.FailAfter))).
+		Build()).Error()
 
-	if _, ok := cfg.config[identifier]; ok {
-		delete(cfg.config, identifier)
-		if err := writeConfig(cfg.config, file); err != nil {
-			log.Printf("write config after delete: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	} else {
-		log.Printf(`no such endpoint "%s"`, identifier)
-		w.WriteHeader(http.StatusNotFound)
-	}
-}
-
-func getEndpoints(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		log.Printf("request from %s rejected: method %s not allowed",
-			r.RemoteAddr, r.Method)
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	log.Printf("GET %s from %s", r.URL, r.RemoteAddr)
-	payloads := make([]meow.EndpointPayload, 0)
-	for _, endpoint := range cfg.config {
-		payload := meow.EndpointPayload{
-			Identifier:   endpoint.Identifier,
-			URL:          endpoint.URL.String(),
-			Method:       endpoint.Method,
-			StatusOnline: endpoint.StatusOnline,
-			Frequency:    endpoint.Frequency.String(),
-			FailAfter:    endpoint.FailAfter,
-		}
-		payloads = append(payloads, payload)
-	}
-	data, err := json.Marshal(payloads)
 	if err != nil {
-		log.Printf("serialize payloads: %v", err)
+		log.Printf("Valkey error: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	w.Write(data)
+	w.WriteHeader(http.StatusCreated)
 }
 
-const endpointIdentifierPatternRaw = "^/endpoints/([a-z][-a-z0-9]+)$"
+func deleteEndpoint(w http.ResponseWriter, r *http.Request, vk valkey.Client, ctx context.Context) {
+	identifier, err := extractEndpointIdentifier(r.URL.String())
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	vk.Do(ctx, vk.B().Del().Key("endpoint:"+identifier).Build())
+	w.WriteHeader(http.StatusNoContent)
+}
 
-var endpointIdentifierPattern = regexp.MustCompile(endpointIdentifierPatternRaw)
+func getEndpoints(w http.ResponseWriter, r *http.Request, vk valkey.Client, ctx context.Context) {
+	keys, err := vk.Do(ctx, vk.B().Keys().Pattern("endpoint:*").Build()).AsStrSlice()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 
-func extractEndpointIdentifier(endpoint string) (string, error) {
-	matches := endpointIdentifierPattern.FindStringSubmatch(endpoint)
-	if len(matches) == 0 {
-		return "", fmt.Errorf(`endpoint "%s" does not match pattern "%s"`,
-			endpoint, endpointIdentifierPatternRaw)
+	payloads := make([]meow.EndpointPayload, 0)
+	for _, key := range keys {
+		data, _ := vk.Do(ctx, vk.B().Hgetall().Key(key).Build()).AsStrMap()
+		sOnline, _ := strconv.Atoi(data["statusOnline"])
+		fAfter, _ := strconv.Atoi(data["failAfter"])
+
+		payloads = append(payloads, meow.EndpointPayload{
+			Identifier:   key[9:],
+			URL:          data["url"],
+			Method:       data["method"],
+			StatusOnline: uint16(sOnline),
+			Frequency:    data["frequency"],
+			FailAfter:    uint8(fAfter),
+		})
+	}
+	json.NewEncoder(w).Encode(payloads)
+}
+
+var endpointIdentifierPattern = regexp.MustCompile(`^/endpoints/([a-z][-a-z0-9]+)$`)
+
+func extractEndpointIdentifier(path string) (string, error) {
+	matches := endpointIdentifierPattern.FindStringSubmatch(path)
+	if len(matches) < 2 {
+		return "", fmt.Errorf("invalid identifier")
 	}
 	return matches[1], nil
-}
-
-func writeConfig(config Config, configPath string) error {
-	file, err := os.Create(configPath)
-	if err != nil {
-		return fmt.Errorf(`open "%s" for write: %v`, configPath, err)
-	}
-
-	writer := csv.NewWriter(file)
-	defer file.Close()
-	for _, endpoint := range config {
-		record := []string{
-			endpoint.Identifier,
-			endpoint.URL.String(),
-			endpoint.Method,
-			strconv.Itoa(int(endpoint.StatusOnline)),
-			endpoint.Frequency.String(),
-			strconv.Itoa(int(endpoint.FailAfter)),
-		}
-		if err := writer.Write(record); err != nil {
-			return fmt.Errorf(`write endpoint "%s": %v`, endpoint, err)
-		}
-	}
-	writer.Flush()
-	return nil
-}
-
-func mustReadConfig(configPath string) Config {
-	file, err := os.Open(configPath)
-	if os.IsNotExist(err) {
-		// just start with an empty config
-		log.Printf(`the config file "%s" does not exist`, configPath)
-		return Config{}
-	}
-
-	config := make(Config, 0)
-	reader := csv.NewReader(file)
-	defer file.Close()
-	records, err := reader.ReadAll()
-	if err != nil {
-		log.Fatalf("the config file '%s' is malformed: %v", configPath, err)
-	}
-	for i, line := range records {
-		endpoint, err := meow.EndpointFromRecord(line)
-		if err != nil {
-			log.Fatalf(`line %d: "%s": %v`, i, line, err)
-		}
-		config[endpoint.Identifier] = endpoint
-	}
-	return config
 }
