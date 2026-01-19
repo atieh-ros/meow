@@ -22,16 +22,23 @@ func main() {
 
 	log.SetOutput(os.Stderr)
 
-	valkeyURL := os.Getenv("VALKEY_URL")
-	if valkeyURL == "" {
-		valkeyURL = "valkey.frickelcloud.ch:6379"
-	}
+    valkeyURL := os.Getenv("VALKEY_URL")
+    if valkeyURL == "" {
+        valkeyURL = "valkey.frickelcloud.ch:6379"
+    }
 
-	ctx := context.Background()
-	client, err := valkey.NewClient(valkey.ClientOption{
-		InitAddress: []string{"valkey.frickelcloud.ch:6379"},
-		SelectDB:    11, 
-	})
+    valkeyDB := 11 
+    if dbEnv := os.Getenv("VALKEY_DB"); dbEnv != "" {
+        if dbNum, err := strconv.Atoi(dbEnv); err == nil {
+            valkeyDB = dbNum
+        }
+    }
+
+    ctx := context.Background()
+    client, err := valkey.NewClient(valkey.ClientOption{
+        InitAddress: []string{valkeyURL}, 
+        SelectDB:    valkeyDB,           
+    })
 	if err != nil {
 		log.Fatalf("failed to connect to valkey: %v", err)
 	}
